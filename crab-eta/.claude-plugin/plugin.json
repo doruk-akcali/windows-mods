@@ -1,0 +1,5 @@
+{
+  "name": "crab-eta",
+  "version": "0.1.0",
+  "description": "During long tasks, a Claude crab pops up at the bottom-right of the screen with the minutes left."
+}
