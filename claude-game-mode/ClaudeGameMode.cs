@@ -1,19 +1,24 @@
 // Claude game mode: shrinks the Claude app's CPU and RAM claim WITHOUT closing it,
 // so Remote Control chats stay connected (End Task kills them).
-//   on     = below-normal priority + Windows efficiency mode (EcoQoS) + trim RAM
-//            + hard RAM cap of CapMB per process (Windows pages the rest out instead of
-//            letting the working set grow back; Claude keeps running, just slower)
-//   off    = normal priority, efficiency mode back to Windows' default, RAM cap removed
-//   toggle = on if the Claude app is at normal priority, otherwise off
-//   listen = stay in the background and toggle on Ctrl+Alt+G (started at login from the
-//            Startup folder; a shortcut-file hotkey made Windows add ~2 s of delay);
-//            while game mode is on, also puts new Claude processes into it every 5 s
-// Shows a small corner banner at once and beeps rising (on) or falling (off),
-// then does the work while the banner is up.
+//   Two kinds of Claude process:
+//     chat = each chat session (claude-code\...\claude.exe) and everything it starts
+//     app  = the desktop app itself (WindowsApps\...\Claude.exe: main, renderers, GPU, utility)
+//   on     = chats limited all the time; app limited only while no Claude window is open
+//            on screen (minimised, or closed to the tray). While a Claude window is open the
+//            app runs at full speed, so switching to it is instant.
+//            limited = below-normal priority + Windows efficiency mode (EcoQoS) + trim RAM
+//            + hard RAM cap of CapMB per process (Windows pages the rest out)
+//   off    = everything at normal priority, efficiency mode back to default, RAM cap removed
+//   toggle = on if off, otherwise off. The state is the marker file gamemode.on next to the exe
+//   listen = stay in the background: Ctrl+Alt+G toggles; Claude's window is watched
+//            (minimise / restore / show / hide / focus events) to switch the app between
+//            limited and full speed; new Claude processes are caught every 3 s
+// Shows a small corner banner at once and beeps rising (on) or falling (off).
 // Build: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /optimize /out:ClaudeGameMode.exe ClaudeGameMode.cs
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -50,6 +55,12 @@ static class ClaudeGameMode
             QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct Rect { public int Left, Top, Right, Bottom; }
+
+    delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
     [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
     [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode)] static extern bool ProcessFirst(IntPtr snap, ref ProcessEntry e);
     [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode)] static extern bool ProcessNext(IntPtr snap, ref ProcessEntry e);
@@ -66,12 +77,33 @@ static class ClaudeGameMode
     [DllImport("psapi.dll")] static extern bool GetProcessMemoryInfo(IntPtr h, out MemoryCounters counters, uint size);
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint key);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr hmod, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc proc, IntPtr lParam);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect r);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
 
     static BannerForm current; // banner on screen (listen mode replaces it on the next press)
     static bool busy;          // a press is still being applied
     static HotkeyWindow hotkeyWindow; // kept in a field: if collected, Windows drops the hotkey
-    static System.Windows.Forms.Timer watch; // listen mode: catches Claude processes started while on
-    static HashSet<uint> enforced = new HashSet<uint>(); // processes already put into game mode
+    static System.Windows.Forms.Timer watch;    // listen mode: catches new processes, backup window check
+    static System.Windows.Forms.Timer debounce; // listen mode: one sync shortly after a burst of window events
+    static Dictionary<uint, bool> applied = new Dictionary<uint, bool>(); // pid -> limited?
+    static WinEventProc eventProc;      // kept in a field so the hook callback isn't collected
+    static IntPtr globalHook, appHook;  // focus/minimise events (all windows); show/hide (the app only)
+    static uint hookedRoot;
+
+    static readonly string Marker = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "gamemode.on");
+    static bool IsOn() { return File.Exists(Marker); }
+    static void SetOn(bool on)
+    {
+        try { if (on) File.WriteAllText(Marker, DateTime.Now.ToString("s")); else if (File.Exists(Marker)) File.Delete(Marker); }
+        catch { }
+    }
 
     [STAThread]
     static void Main(string[] args)
@@ -92,6 +124,13 @@ static class ClaudeGameMode
         Mutex single = new Mutex(true, "Local\\ClaudeGameModeListener", out createdNew);
         if (!createdNew) return; // already listening
 
+        // Older versions kept the state in the app's priority: carry an "on" state over.
+        if (!IsOn())
+        {
+            uint root;
+            if (FindClaude(out root).Count > 0 && Priority(root) == BelowNormal) SetOn(true);
+        }
+
         hotkeyWindow = new HotkeyWindow();
         bool ok = false;
         // Ctrl+Alt+G, no auto-repeat; retry while another program may still be releasing it.
@@ -105,33 +144,38 @@ static class ClaudeGameMode
             Application.Run(MakeBanner("Ctrl+Alt+G is taken", "Another program uses this key; the game mode key is off.", false, null, null));
             return;
         }
+
+        debounce = new System.Windows.Forms.Timer();
+        debounce.Interval = 60;
+        debounce.Tick += delegate { debounce.Stop(); if (!busy) Sync(false); };
+
+        // Out-of-context hooks: Windows posts the events to this thread's message loop.
+        eventProc = delegate (IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+        {
+            if (idObject != 0 || !IsOn()) return; // 0 = the window itself, not a part of it
+            debounce.Stop(); debounce.Start();
+        };
+        // 0x0003 foreground .. 0x0017 minimise end
+        globalHook = SetWinEventHook(0x0003, 0x0017, IntPtr.Zero, eventProc, 0, 0, 0x0002); // WINEVENT_SKIPOWNPROCESS
+
         watch = new System.Windows.Forms.Timer();
-        watch.Interval = 5000;
-        watch.Tick += delegate { Enforce(); };
+        watch.Interval = 3000;
+        watch.Tick += delegate { if (!busy) Sync(false); };
         watch.Start();
+        Sync(false);
         TrimSelf();
         Application.Run();
         GC.KeepAlive(single);
     }
 
-    // While game mode is on, a new chat or a restarted app window starts new Claude processes
-    // at normal RAM; give them the same treatment. The cap itself is enforced by Windows.
-    static void Enforce()
+    // Show/hide events only for the app's main process (it owns the windows); re-hooked if the app restarts.
+    static void HookApp(uint root)
     {
-        if (busy) return;
-        uint root;
-        List<uint> tree = FindClaude(out root);
-        if (tree.Count == 0 || Priority(root) != BelowNormal) { enforced.Clear(); return; }
-        enforced.IntersectWith(tree);
-        foreach (uint pid in tree)
-        {
-            if (enforced.Contains(pid)) continue;
-            IntPtr h = OpenProcess(Access, false, pid);
-            if (h == IntPtr.Zero) continue;
-            Settle(h, true);
-            CloseHandle(h);
-            enforced.Add(pid);
-        }
+        if (root == hookedRoot) return;
+        if (appHook != IntPtr.Zero) { UnhookWinEvent(appHook); appHook = IntPtr.Zero; }
+        hookedRoot = root;
+        if (root != 0 && eventProc != null)
+            appHook = SetWinEventHook(0x8002, 0x8003, IntPtr.Zero, eventProc, root, 0, 0x0002); // object show .. hide
     }
 
     internal static void OnHotkey()
@@ -146,18 +190,83 @@ static class ClaudeGameMode
     static BannerForm Decide(string mode, Mutex mutex)
     {
         uint root;
-        List<uint> tree = FindClaude(out root);
-        if (tree.Count == 0) return MakeBanner("Claude is not running", "Nothing to change.", false, null, mutex);
-        bool on = mode == "on" || (mode == "toggle" && Priority(root) != BelowNormal);
+        if (FindClaude(out root).Count == 0) return MakeBanner("Claude is not running", "Nothing to change.", false, null, mutex);
+        bool on = mode == "on" || (mode == "toggle" && !IsOn());
+        SetOn(on);
         busy = true;
         return MakeBanner(on ? "Claude game mode ON" : "Claude game mode OFF",
-                          on ? "Low priority \u00B7 Remote Control stays connected" : "Back to normal speed",
-                          on, delegate { return Apply(tree, on); }, mutex);
+                          on ? "Chats limited \u00B7 app at full speed while its window is open" : "Back to normal speed",
+                          on, delegate { return Sync(true); }, mutex);
     }
 
-    // Every claude.exe (desktop app + one per open chat) and everything they started.
-    // root = the desktop app's main process, whose priority tells the current state.
-    static List<uint> FindClaude(out uint root)
+    // Brings every Claude process to the state it should have now; only changed ones are touched.
+    static string Sync(bool report)
+    {
+        uint root;
+        Dictionary<uint, bool> tree = FindClaude(out root); // pid -> is an app process
+        HookApp(root);
+        bool on = IsOn();
+        HashSet<uint> appPids = new HashSet<uint>();
+        foreach (KeyValuePair<uint, bool> kv in tree) if (kv.Value) appPids.Add(kv.Key);
+        bool open = on && AppWindowOpen(appPids);
+
+        long before = 0, after = 0;
+        int capped = 0, failed = 0;
+        List<uint> gone = new List<uint>();
+        foreach (uint pid in applied.Keys) if (!tree.ContainsKey(pid)) gone.Add(pid);
+        foreach (uint pid in gone) applied.Remove(pid);
+
+        foreach (KeyValuePair<uint, bool> kv in tree)
+        {
+            bool limit = on && (!kv.Value || !open);
+            bool prev;
+            bool known = applied.TryGetValue(kv.Key, out prev);
+            // A process never limited and not to be limited is left as Claude set it (a toggle press still resets all).
+            if (!known && !limit && !report && !Capped(kv.Key)) { applied[kv.Key] = false; continue; }
+            bool change = !known || prev != limit;
+            if (!change && !report) continue;
+            IntPtr h = OpenProcess(Access, false, kv.Key);
+            if (h == IntPtr.Zero) continue;
+            if (report) before += WorkingSet(h);
+            if (change)
+            {
+                bool ok = Settle(h, limit);
+                if (limit) { if (ok) capped++; else failed++; }
+                applied[kv.Key] = limit;
+            }
+            if (report) after += WorkingSet(h);
+            CloseHandle(h);
+        }
+        if (!report) return null;
+        if (!on) return string.Format("Claude RAM {0:N0} MB \u00B7 Ctrl+Alt+G for game mode", after >> 20);
+        return string.Format("RAM {0:N0} \u2192 {1:N0} MB \u00B7 {2} \u00B7 Ctrl+Alt+G undoes",
+            before >> 20, after >> 20, failed > 0 && capped == 0 ? "RAM cap failed" : "max " + CapMB + " MB per chat");
+    }
+
+    // Is any real Claude window on screen (shown, not minimised, not on another virtual desktop)?
+    static bool AppWindowOpen(HashSet<uint> appPids)
+    {
+        if (appPids.Count == 0) return false;
+        bool found = false;
+        EnumWindows(delegate (IntPtr w, IntPtr l)
+        {
+            uint pid;
+            GetWindowThreadProcessId(w, out pid);
+            if (!appPids.Contains(pid) || !IsWindowVisible(w) || IsIconic(w)) return true;
+            if ((GetWindowLong(w, -20) & 0x80) != 0) return true; // tool window
+            Rect r;
+            if (!GetWindowRect(w, out r) || r.Right - r.Left < 200 || r.Bottom - r.Top < 150) return true;
+            int cloaked;
+            if (DwmGetWindowAttribute(w, 14, out cloaked, 4) == 0 && cloaked != 0) return true; // DWMWA_CLOAKED
+            found = true;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // Every claude.exe and everything they started, each marked app (true) or chat (false) by its
+    // nearest claude.exe ancestor. root = the desktop app's main process.
+    static Dictionary<uint, bool> FindClaude(out uint root)
     {
         Dictionary<uint, uint> parent = new Dictionary<uint, uint>();
         Dictionary<uint, string> name = new Dictionary<uint, string>();
@@ -171,27 +280,32 @@ static class ClaudeGameMode
         }
         CloseHandle(snap);
 
-        HashSet<uint> set = new HashSet<uint>();
+        Dictionary<uint, bool> kind = new Dictionary<uint, bool>(); // claude.exe pid -> is app
         foreach (KeyValuePair<uint, string> kv in name)
-            if (IsClaude(kv.Value)) set.Add(kv.Key);
+            if (IsClaude(kv.Value))
+                kind[kv.Key] = ImagePath(kv.Key).IndexOf("\\WindowsApps\\", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        Dictionary<uint, bool> set = new Dictionary<uint, bool>(kind);
         bool added;
         do
         {
             added = false;
             foreach (KeyValuePair<uint, uint> kv in parent)
-                if (kv.Key != 0 && !set.Contains(kv.Key) && set.Contains(kv.Value)) { set.Add(kv.Key); added = true; }
+            {
+                bool k;
+                if (kv.Key != 0 && !set.ContainsKey(kv.Key) && set.TryGetValue(kv.Value, out k)) { set[kv.Key] = k; added = true; }
+            }
         } while (added);
 
         root = 0;
-        foreach (uint pid in set)
+        foreach (KeyValuePair<uint, bool> kv in kind)
         {
-            string n, pn; uint pp;
-            if (!name.TryGetValue(pid, out n) || !IsClaude(n)) continue;
-            if (parent.TryGetValue(pid, out pp) && name.TryGetValue(pp, out pn) && IsClaude(pn)) continue;
-            if (root == 0) root = pid;
-            if (ImagePath(pid).IndexOf("\\WindowsApps\\", StringComparison.OrdinalIgnoreCase) >= 0) { root = pid; break; }
+            uint pp; string pn;
+            if (parent.TryGetValue(kv.Key, out pp) && name.TryGetValue(pp, out pn) && IsClaude(pn)) continue;
+            if (root == 0) root = kv.Key;
+            if (kv.Value) { root = kv.Key; break; }
         }
-        return new List<uint>(set);
+        return set;
     }
 
     static bool IsClaude(string exe) { return string.Equals(exe, "claude.exe", StringComparison.OrdinalIgnoreCase); }
@@ -215,6 +329,17 @@ static class ClaudeGameMode
         return p;
     }
 
+    // Does the process carry a hard RAM cap (set by game mode, here or by an earlier run)?
+    static bool Capped(uint pid)
+    {
+        IntPtr h = OpenProcess(0x1000, false, pid);
+        if (h == IntPtr.Zero) return false;
+        UIntPtr min, max; uint flags;
+        bool capped = GetProcessWorkingSetSizeEx(h, out min, out max, out flags) && (flags & HardMaxEnable) != 0;
+        CloseHandle(h);
+        return capped;
+    }
+
     static long WorkingSet(IntPtr h)
     {
         MemoryCounters c;
@@ -223,43 +348,23 @@ static class ClaudeGameMode
 
     static void TrimSelf() { GC.Collect(); EmptyWorkingSet(GetCurrentProcess()); }
 
-    static string Apply(List<uint> tree, bool on)
-    {
-        long before = 0, after = 0;
-        int capped = 0;
-        List<IntPtr> handles = new List<IntPtr>();
-        foreach (uint pid in tree)
-        {
-            IntPtr h = OpenProcess(Access, false, pid);
-            if (h == IntPtr.Zero) continue;
-            before += WorkingSet(h);
-            if (Settle(h, on)) capped++;
-            handles.Add(h);
-        }
-        foreach (IntPtr h in handles) { after += WorkingSet(h); CloseHandle(h); }
-        enforced = on ? new HashSet<uint>(tree) : new HashSet<uint>();
-        if (!on) return string.Format("Claude RAM {0:N0} MB \u00B7 Ctrl+Alt+G for game mode", after >> 20);
-        return string.Format("RAM {0:N0} \u2192 {1:N0} MB \u00B7 {2} \u00B7 Ctrl+Alt+G undoes",
-            before >> 20, after >> 20, capped > 0 ? "max " + CapMB + " MB per process" : "RAM cap failed");
-    }
-
-    // Puts one process into (or out of) game mode; returns whether the RAM cap change took.
-    static bool Settle(IntPtr h, bool on)
+    // Puts one process into (or out of) the limited state; returns whether the RAM cap change took.
+    static bool Settle(IntPtr h, bool limit)
     {
         PowerThrottling state = new PowerThrottling();
-        state.Version = 1; state.ControlMask = on ? 1u : 0u; state.StateMask = on ? 1u : 0u;
-        SetPriorityClass(h, on ? BelowNormal : Normal);
+        state.Version = 1; state.ControlMask = limit ? 1u : 0u; state.StateMask = limit ? 1u : 0u;
+        SetPriorityClass(h, limit ? BelowNormal : Normal);
         SetProcessInformation(h, 4, ref state, (uint)Marshal.SizeOf(typeof(PowerThrottling))); // 4 = ProcessPowerThrottling
-        bool limited = Limit(h, on);
-        if (on) EmptyWorkingSet(h);
-        return limited;
+        bool ok = Limit(h, limit);
+        if (limit) EmptyWorkingSet(h);
+        return ok;
     }
 
     // Hard working-set cap: Windows keeps the process's RAM at or below CapMB and pages the
     // rest out, rather than failing allocations, so nothing crashes. Off = cap made soft again.
-    static bool Limit(IntPtr h, bool on)
+    static bool Limit(IntPtr h, bool limit)
     {
-        if (on) return SetProcessWorkingSetSizeEx(h, new UIntPtr(1u << 20), new UIntPtr((ulong)CapMB << 20), HardMinDisable | HardMaxEnable);
+        if (limit) return SetProcessWorkingSetSizeEx(h, new UIntPtr(1u << 20), new UIntPtr((ulong)CapMB << 20), HardMinDisable | HardMaxEnable);
         UIntPtr min, max; uint flags;
         return GetProcessWorkingSetSizeEx(h, out min, out max, out flags)
             && SetProcessWorkingSetSizeEx(h, min, max, HardMinDisable | HardMaxDisable);
@@ -273,7 +378,7 @@ static class ClaudeGameMode
         using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) s = g.DpiX / 96f;
 
         BannerForm form = new BannerForm();
-        form.ClientSize = new Size((int)(420 * s), (int)(84 * s));
+        form.ClientSize = new Size((int)(440 * s), (int)(84 * s));
         Rectangle wa = Screen.PrimaryScreen.WorkingArea;
         form.Location = new Point(wa.Right - form.Width - (int)(16 * s), wa.Bottom - form.Height - (int)(16 * s));
 
