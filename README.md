@@ -7,7 +7,7 @@ Small tools and tweaks for Windows 11 and the Claude desktop app. Larger project
 | [`crab-eta/`](crab-eta) | Claude Code mod: during long tasks, a Claude crab at the bottom-right of the screen shows the minutes left; its colour follows the 5-hour usage and the flag in its claw the weekly usage |
 | [`claude-game-mode/`](claude-game-mode) | Ctrl+Alt+G shrinks the Claude app's CPU and RAM use (below-normal priority, efficiency mode, RAM cap) without closing it, so remote chats stay connected while gaming. The app itself runs at full speed whenever its window is on screen, so switching to it stays instant |
 | [`cursor-resizer/`](cursor-resizer) | Redraws a Windows cursor pack (`.cur` / `.ani`) smaller, keeping every frame sharp and the click point exact — used to make the [apple_cursor](https://github.com/ful1e5/apple_cursor) macOS pointers 85% size |
-| [`scripts/`](scripts) | `lockout-report.ps1`: saves the last 24 h of failed sign-ins and account lockouts from the Security log (admin terminal) |
+| [`scripts/`](scripts) | `lockout-report.ps1`: saves the last 24 h of failed sign-ins and account lockouts from the Security log (admin terminal). `monthly-cleanup.ps1`: monthly clear-out of temporary data, run by Task Scheduler |
 
 ## crab-eta
 
@@ -32,3 +32,24 @@ powershell.exe -File curscale.ps1 CurScale.cs <input-folder> <output-folder> <pr
 ```
 
 Then point Settings → Mouse pointer (or `HKCU\Control Panel\Cursors`) at the output folder. Cursor packs keep their own licence (apple_cursor is GPL-3.0), so this repo ships the tool, not the cursors.
+
+## monthly-cleanup
+
+`scripts/monthly-cleanup.ps1` clears data that is only ever temporary, and logs what it freed to `cleanup.log` next to itself:
+
+| Folder | Rule |
+|---|---|
+| `%TEMP%` | items untouched for 7+ days (newer ones may be in use) |
+| `%LOCALAPPDATA%\CrashDumps` | dumps older than 7 days |
+| Spotify streaming cache | only while Spotify is closed |
+| Brave / Chrome / Edge `Cache`, `Code Cache`, `GPUCache` | only while that browser is closed; history, logins and cookies are untouched |
+| Recycle Bin | items deleted more than 30 days ago |
+
+GPU shader caches, `hiberfil.sys`, `pagefile.sys` and Downloads are left alone on purpose.
+
+```
+powershell.exe -File scripts\monthly-cleanup.ps1 -WhatIf          # dry run: shows what would go
+powershell.exe -File scripts\install-monthly-cleanup.ps1           # task "Monthly Cleanup": 1st of each month, 13:00
+```
+
+The task runs as the current user, catches up after a missed run (laptop off or asleep), and starts PowerShell through `conhost --headless` so no console window flashes.
